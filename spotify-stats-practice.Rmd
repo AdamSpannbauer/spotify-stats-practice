@@ -1,0 +1,706 @@
+---
+title: Practice some statistics with spotify data
+author: me
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+library(jsonlite)
+library(tidyverse)
+
+SPOTIFY_DATA_DIR <- "../../../../spotify2022/spotify_data/"
+```
+
+```{r helpers, include=FALSE}
+read_streaming_history_file <- function(path) {
+  # Read a single "StreamingHistory<i>.json" file into a df
+  stream_list <- read_json(path)
+  stream_list <- lapply(stream_list, as.data.frame)
+
+  stream_df <- do.call(rbind, stream_list)
+
+  stream_df$endTime <- ymd_hm(stream_df$endTime)
+  stream_df$endTime <- with_tz(stream_df$endTime, "US/Eastern")
+
+  stream_df
+}
+
+read_streaming_history <- function(data_folder) {
+  # Read a dir of "StreamingHistory<i>.json" files to a df
+  json_files <- list.files(
+    data_folder,
+    full.names = TRUE,
+    pattern = "^StreamingHistory.*\\.json$"
+  )
+
+  spotify_df_list <- lapply(seq_along(json_files), function(i) {
+    message("Reading file", i, "of", length(json_files), "...\n")
+    read_streaming_history_file(json_files[i])
+  })
+
+  do.call(rbind, spotify_df_list)
+}
+```
+
+# Data overview and cleaning
+
+The data is my spotify listening history for the year 2022.
+
+```{r data_read, message=FALSE}
+raw_data <- read_streaming_history(SPOTIFY_DATA_DIR)
+dim(raw_data)
+print(head(raw_data, 4), row.names = FALSE)
+```
+
+I want to investigate fitting a Poisson distribution to the count of songs played per day.  Some data transformations to support this are:
+
+-   Calculate seconds played
+-   Create date and hour from date time
+-   Filter to between 10 min and 20 sec plays
+    -   Considering under 20 sec to be a "skip"
+    -   Considering over 10 min to be a podcast (sorry grateful dead and ping ponging pigeons)
+
+```{r data_clean}
+listening_22 <- raw_data |>
+  mutate(secPlayed = msPlayed / 1000) |>
+  mutate(date = as.Date(endTime)) |>
+  mutate(hour = hour(endTime)) |>
+  # (20 secs, 10 min) arbitrary range for a "song" to be "listened" to
+  filter(secPlayed < 10 * 60) |>
+  filter(secPlayed > 20) |>
+  dplyr::select(-msPlayed, -endTime)
+
+dim(listening_22)
+print(head(listening_22, 4), row.names = FALSE)
+```
+
+None of the analysis focuses on the duration of a song listen, but good to see nothing too too crazy in this picture.
+
+```{r sec_played_dist, message=FALSE}
+ggplot(listening_22, aes(x = secPlayed)) +
+  geom_histogram() +
+  labs(title = "Distribution of seconds played per song")
+```
+
+```{r count_songs_by_day, message=FALSE}
+full_date_range <- data.frame(
+  date = seq(
+    from = min(listening_22$date),
+    to = max(listening_22$date),
+    by = "1 day"
+  )
+)
+
+songs_by_day <- listening_22 |>
+  group_by(date) |>
+  summarise(n_songs_played = n()) |>
+  right_join(full_date_range) |>
+  arrange(date) |>
+  replace_na(list(n_songs_played = 0))
+```
+
+The main focus so far is looking at songs played per day.  Here's a couple different views of that data.
+
+```{r plot_songs_by_day}
+ggplot(songs_by_day, aes(x = date, y = n_songs_played)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Count of songs played per day",
+    x = "Date",
+    y = "Count of songs played"
+  )
+```
+
+```{r plot_songs_by_day_dist}
+ggplot(songs_by_day, aes(x = n_songs_played)) +
+  geom_histogram(binwidth = 5) +
+  labs(title = "Distribution of songs played per day")
+```
+
+# Estimate overall rate
+
+## Maximum Likelihood Estimation
+
+Poisson PMF
+
+$$
+P(X = x) = \frac{\lambda^x e^{-\lambda}}{x!}
+$$
+
+Likelihood
+
+$$
+L(\lambda) = \prod_{i=1}^n{\frac{\lambda^{x_i} e^{-\lambda}}{x_i!}}
+$$
+
+Log-likelihood for easier math with sums
+
+$$
+\ln L(\lambda) = \sum_{i=1}^n{x_i \ln \lambda - \lambda - \ln{x_i!}}
+$$
+
+To find the MLE take derivative and set equal to zero
+
+$$
+\frac{d}{d \lambda} \ln L(\lambda) = \sum_{i = 1}^n \frac{x_i}{\lambda} - 1 = 0
+$$
+
+Solve for $\lambda$
+
+$$
+\hat{\lambda} = \frac{1}{n} \sum_{i = 1}^n x_i
+$$
+
+Applying we get the average songs per day to be:
+
+```{r mle_lambda, message=FALSE, warning=FALSE}
+x <- songs_by_day$n_songs_played
+n <- length(x)
+mle_lambda <- sum(x) / n
+
+mle_lambda
+```
+
+```{r mle_density}
+x_range <- seq(from = -5, to = round(max(x)) + 5, by = 1)
+mle_density <- data.frame(x = x_range, y = dpois(x_range, mle_lambda))
+
+songs_by_day |>
+  group_by(n_songs_played) |>
+  summarise(perc = n() / nrow(songs_by_day)) |>
+  ggplot(aes(x = n_songs_played, y = perc)) +
+  geom_bar(stat = "identity") +
+  geom_line(
+    data = mle_density,
+    aes(x, y * 0.5),
+    linetype = "dashed",
+    color = "#ff8800",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Theoritical Poisson with MLE lambda overlaying observed"
+  )
+```
+
+## Estimate with Bayes
+
+Using an uninformative $Gamma$ distributed prior (good brief explanation from [stackexchange](https://math.stackexchange.com/a/456050/464500))
+
+> The distribution $Gamma(\alpha=0.001,\beta=0.001)$ does indeed have most of its mass very close to 0, but it also has an impressive tail, so in fact its mean is $1$.
+> This observation, however, is unrelated to its vagueness.
+> It is *vague* in the sense that as soon as you update it based on your first empirical observation, the posterior distribution will tell you that whatever data point you observed is a very typical one.
+> Put another way, it reflects a belief that is very weakly held and easily molded by exposure to new information.
+>
+> Let's say that you're trying to estimate the average number of calls that come into a call center per hour, modeled as a Poisson distribution with rate $\lambda$.
+> $Gamma(\alpha=0.001,\beta=0.001)$ reflects your prior belief about the value of $\lambda$.
+> In your first hour of observation, $50$ calls come in, so you perform a Bayesian update and derive $Gamma(\alpha=50.001, \beta=1.001)$ as your posterior.
+> This posterior distribution has a mean of $\frac{50.001}{1.001} \approx 50$.
+> So, now that you have actual data, you've almost completely thrown away your old prejudices and updated your beliefs to match your empirical observations.
+>
+> It's quite common to use $Gamma(\alpha=0,\beta=0)$ as a prior.
+> That distribution doesn't even make mathematical sense: its PDF contains the term $0^0$ and regardless whether you decide that $0^0=0$ or $0^0=1$, the total area under the distribution curve will come out to $0$ or $\infty$ respectively: not $1$.
+> Nonetheless, that doesn't stop us from using it as a prior: we'll get a sensible posterior as soon as we observe our first data point.
+> A prior of this sort is called an *improper* prior.
+> Some authors use $improper$ and $vague$ interchangeably.
+
+Poisson PMF
+
+$$
+P(X = x) = \frac{\lambda^x e^{-\lambda}}{x!}
+$$
+
+Likelihood
+
+$$
+L(x_i | \lambda) = \prod_{i=1}^n{\frac{\lambda^{x_i} e^{-\lambda}}{x_i!}}
+$$
+
+In Bayes we'll work with something proportional to the likelihood instead of likelihood itself (makes life easier and works out to same results).
+
+$$
+L(x_i | \lambda) \propto \prod_{i=1}^n{\lambda^{x_i} e^{-\lambda}}
+$$
+
+The prior distribution of $Gamma(\alpha, \beta)$ has PDF
+
+$$
+Gamma(\alpha, \beta) = \frac{\beta ^ \alpha}{ \Gamma(\alpha)} x^{\alpha-1} e^{-\beta x}
+$$
+
+The posterior is the product of these
+
+$$
+\pi(\lambda) \propto \prod_{i=1}^n{\lambda^{x_i} e^{-\lambda}} \times \frac{\beta ^ \alpha}{ \Gamma(\alpha)} \lambda^{\alpha-1} e^{-\beta \lambda}
+$$ Drop out $\frac{\beta ^ \alpha}{ \Gamma(\alpha)}$; scalar as far as $\lambda$ is concerned.
+
+$$
+\pi(\lambda) \propto \prod_{i=1}^n{\lambda^{x_i} e^{-\lambda}} \times  \lambda^{\alpha-1} e^{-\beta \lambda}
+$$ Simplify
+
+$$
+\pi(\lambda) \propto \lambda^{\sum{x_i}} e^{-n\lambda} \times  \lambda^{\alpha-1} e^{-\beta \lambda}
+$$
+
+Further simplify
+
+$$
+\pi(\lambda) \propto \lambda^{(\alpha + \sum{x_i}) - 1} e^{-(\beta + n) \lambda}
+$$
+
+This turns out to be $Gamma(\alpha + \sum{x_i}, \beta + n)$.
+In other words given the data you can calculate the posterior dist as gamma with:
+
+$$
+\alpha_{post} = \alpha_{prior} + \sum{x_i} \quad;\quad \beta_{post} = \beta_{prior} + n
+$$ Applying this we get
+
+```{r bayes_estimate, warning=FALSE}
+x <- songs_by_day$n_songs_played
+n <- length(x)
+
+# Gamma(0, 0)
+prior_alpha <- 0
+prior_beta <- 0
+
+# Gamma(alpha + sum(x), beta + n)
+posterior_alpha <- prior_alpha + sum(x)
+posterior_beta <- prior_beta + n
+
+n_samples <- 1e5
+prior_post_samples <- data.frame(
+  Prior = rgamma(n_samples, prior_alpha, prior_beta),
+  Posterior = rgamma(n_samples, posterior_alpha, posterior_beta)
+) |>
+  pivot_longer(everything())
+
+ggplot(prior_post_samples, aes(x = value, fill = name)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = prior_alpha / prior_beta, linetype = "dotted", color = "blue") +
+  geom_vline(xintercept = posterior_alpha / posterior_beta, linetype = "dotted", color = "red") +
+  labs(
+    title = bquote(
+      "Distribution of" ~ lambda[pre] ~ "and" ~ lambda[post]
+    ),
+    subtitle = "Gamma(0, 0) isn't the most plottable distribution",
+    fill = ""
+  ) +
+  lims(x = c(-2, 55), y = c(0, 2))
+```
+
+Or just viewing the posterior
+
+```{r posterior_desnsity}
+prior_post_samples |>
+  filter(name == "Posterior") |>
+  ggplot(aes(x = value)) +
+  geom_density(alpha = 0.5, fill = "#F8766D") +
+  geom_vline(xintercept = posterior_alpha / posterior_beta, linetype = "dotted", color = "red") +
+  labs(
+    title = bquote(
+      "Distribution of" ~ lambda[post]
+    ),
+    fill = ""
+  )
+```
+
+It is worth noting that if estimating Poisson $\lambda$ using a $Gamma(0, 0)$ prior and updating with $Gamma(\alpha + \sum{x_i}, \beta + n)$ then the expected value ( $\mathbb{E}[Gamma(\alpha, \beta)] = \frac{\alpha}{\beta}$ or in this case $\mathbb{E}[Gamma(0 + \sum{x_i}, 0 + n)] = \frac{\sum{x_i}}{n} = \frac{1}{n} \sum{x_i}$ ) is exactly equal to the MLE estimator ($\frac{1}{n} \sum{x_i}$ ).
+
+For that reason, there's not a overlaying the theoretical density on observed data and no further comparison.
+
+## Fisher information of $\lambda$ in Poisson
+
+Doesn't really relate as much to overall idea, but just something to practice.
+
+The Fisher information in general is represented as:
+
+$$
+I(\lambda) = \mathbb{E}\left[\left(\frac{d}{d\lambda} \ln L(\lambda)\right)^2\right] = -\mathbb{E}\left[\left(\frac{d^2}{d\lambda^2} \ln L( \lambda) \right)\right]
+$$
+
+Poisson log likelihood is
+
+$$
+\ln L(\lambda) = \sum_{i=1}^n{x_i \ln \lambda - \lambda - \ln{x_i!}}
+$$
+
+First derivative of the log likelihood
+
+$$
+\frac{d}{d\lambda} \ln L(\lambda) = \sum_{i=1}^n{\frac{x_i}{\lambda} - 1} = -n + \frac{1}{\lambda} \sum{x_i}
+$$
+
+Second derivative of the log likelihood
+
+$$
+\frac{d^2}{d\lambda^2} \ln L(\lambda) = -\frac{1}{\lambda^2} \sum{x_i}
+$$
+
+Plugging into the fisher information formula
+
+$$
+I(\lambda) = \mathbb{E}\left[\left(-n + \frac{1}{\lambda}\sum{x_i}\right)^2\right] = -\mathbb{E}\left[\left(-\frac{1}{\lambda^2} \sum{x_i}\right)\right]
+$$
+
+Working with the second derivative view seems nicer.
+Pull out the $\frac{1}{\lambda^2}$; just a scalar to the sum.
+
+$$
+I(\lambda) = \frac{1}{\lambda^2}  \mathbb{E}\left[\sum{x_i}\right]
+$$
+
+Expectation of sum is equal to sum of expectations.
+Expected value of Poisson is $\lambda$.
+Simplify.
+
+$$
+I(\lambda) = \frac{1}{\lambda^2}\sum{\mathbb{E}[x_i]} = \frac{1}{\lambda^2}\sum{\lambda} = \frac{n\lambda}{\lambda^2}
+$$
+
+Further simplified.
+Here is our Fisher information for Poisson rate parameter $\lambda$.
+
+$$
+I(\lambda) = \frac{n}{\lambda}
+$$
+
+Intuitive explanation of the fisher information.
+
+-   $n$ the more observations the higher the information
+-   $\frac{1}{\lambda}$ higer rates will lower our information
+    -   e.g.: If you have $n=50$ and the average rate is $\lambda=1$ per day then you have a lot of information about the process; but if you have $n=50$ and the average rate is $\lambda=100$ per day then you don't have much information
+
+Fisher information for our data with estimated $\lambda \approx 53.52$ and $n = 366$
+
+```{r lamda_fisher_info}
+53.52 / 366
+```
+
+# Detecting a change point
+
+Was there a change in this listening rate?
+
+```{r plot_songs_by_day2}
+ggplot(songs_by_day, aes(x = date, y = n_songs_played)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Count of songs played per day",
+    x = "Date",
+    y = "Count of songs played"
+  )
+```
+
+Going to model 3 parameters:
+
+-   $\tau$ - the change point (i.e. if there was a change at the 120th day of the year $\tau = 120$)
+    -   Uniform prior $\tau_{prior} \sim \operatorname{DiscreteUniform}(1, 365)$
+-   $\lambda_1$ - the rate parameter for a poisson distribution of my listening *before* $\tau$
+    -   Uninformative Gamma prior $\lambda_{1prior} \sim \operatorname{Gamma(0, 0)}$
+-   $\lambda_2$ - the rate parameter for a poisson distribution of my listening *after* $\tau$
+    -   Uninformative Gamma prior $\lambda_{2prior} \sim \operatorname{Gamma(0, 0)}$
+
+Posterior distributions
+
+Using $Gamma(\alpha_\text{prior}, \beta_\text{prior})$ as prior for a Poisson rate parameter we can update to posterior using $Gamma(\alpha_\text{prior} + \sum x_i, \beta_\text{prior} + n)$.
+
+If using $Gamma(0, 0)$ as the prior this simplifies to $Gamma(\sum x_i, n)$ with $\mathbb{E}[Gamma(\sum x_i, n)] = \frac{\sum x_i}{n}$
+
+For a given value of $\tau$
+
+-   $\lambda_{1posterior} \sim Gamma(\sum{x_{1i}}, n_1) = Gamma(\sum{x_{1i}}, \tau)$
+    -   $x1$ denotes all $x$ before $\tau$
+    -   $\mathbb{E}[\lambda_{1posterior}] = \frac{\sum x_{1i}}{n_1} = \frac{\sum x_{1i}}{\tau}$
+    -   $L(x_{1i} | \lambda_{1}) \propto \prod_{i=1}^{n_1}{\lambda_1^{x_{1i}} e^{-\lambda_{1}}}$
+-   $\lambda_{2posterior} \sim Gamma(\sum{x_{2i}}, n_2) = Gamma(\sum{x_{2i}}, n - \tau)$
+    -   $x2$ denotes all $x$ after $\tau$
+    -   $\mathbb{E}[\lambda_{2posterior}] = \frac{\sum x_{2i}}{n_2} = \frac{\sum x_{2i}}{n - \tau}$
+    -   $L(x_{2i} | \lambda_2) \propto \prod_{i=1}^{n_2}{\lambda_2^{x_{2i}} e^{-\lambda_{2}}}$
+
+All of that leads to
+
+$$
+L(\tau) \propto \prod_{i=1}^{n_1}{\lambda_1^{x_{1i}} e^{-\lambda_1}} \times \prod_{i=1}^{n_2}{\lambda_2^{x_{2i}} e^{-\lambda_2}}
+$$
+
+```{r likelihood_funcs_v0}
+# defaults to MLE lambda if not provided
+pois_likelihood_propto <- function(x, lambda = sum(x) / length(x)) {
+  L <- 1
+  for (xi in x) {
+    Li <- (lambda^xi * exp(-lambda))
+    L <- L * Li
+  }
+
+  return(L)
+}
+
+posterior_tau <- function(x, tau) {
+  # ASSUMES X IS SORTED BY DATE!!
+  n <- length(x)
+
+  if (tau == 0 | tau == n) {
+    return(0)
+  }
+
+  x1 <- x[1:tau]
+  n1 <- length(x1)
+
+  x2 <- x[(tau + 1):n]
+  n2 <- length(x2)
+
+  lambda1 <- sum(x1) / n1
+  lambda2 <- sum(x2) / n2
+
+  x1_likelihood <- pois_likelihood_propto(x1, lambda1)
+  x2_likelihood <- pois_likelihood_propto(x2, lambda2)
+
+  x1_likelihood * x2_likelihood
+}
+```
+
+Implementing this leads to an example of a practical computing reason we prefer log likelihoods...
+
+```{r apply_likelihood_funcs_v0}
+x <- songs_by_day$n_songs_played
+tau_dist <- vapply(seq_along(x), \(tau) posterior_tau(x, tau), numeric(1))
+
+head(tau_dist)
+```
+
+Convert to be log likelihood
+
+$$
+\ln L(\lambda) = \sum_{i=1}^n{x_i \ln \lambda - \lambda - \ln{x_i!}}
+$$
+
+and this leads to
+
+$$
+L(\tau) = \sum_{i=1}^{n_1}{x_{1i} \ln \lambda_1 - \lambda_1 - \ln{x_{1i}!}} + \sum_{i=1}^{n_2}{x_{2i} \ln \lambda_2 - \lambda_2 - \ln{x_{2i}!}}
+$$
+
+For implementation instead of `log(factorial(x))`, I'll use `lgamma(x + 1)` (log gamma function for generalized factorial; more numerically stable).
+
+```{r likelihood_funcs_v1}
+# defaults to MLE lambda if not provided
+pois_log_likelihood <- function(x, lambda = sum(x) / length(x)) {
+  sum(x * log(lambda) - lambda - lgamma(x + 1))
+}
+
+posterior_tau <- function(x, tau) {
+  # ASSUMES X IS SORTED BY DATE!!
+  n <- length(x)
+
+  if (tau == 0 | tau == n) {
+    return(-Inf)
+  }
+
+  x1 <- x[1:tau]
+  n1 <- length(x1)
+
+  x2 <- x[(tau + 1):n]
+  n2 <- length(x2)
+
+  lambda1 <- sum(x1) / n1
+  lambda2 <- sum(x2) / n2
+
+  x1_log_likelihood <- pois_log_likelihood(x1, lambda1)
+  x2_log_likelihood <- pois_log_likelihood(x2, lambda2)
+
+  x1_log_likelihood + x2_log_likelihood
+}
+```
+
+```{r apply_likelihood_funcs_v1}
+x <- songs_by_day$n_songs_played
+n <- length(x)
+tau_choices <- 1:(n - 1)
+log_tau_dist <- vapply(tau_choices, \(tau_i) posterior_tau(x, tau_i), numeric(1))
+
+# exponentiate and normalize
+tau_post_probs <- exp(log_tau_dist - max(log_tau_dist))
+tau_post_probs <- tau_post_probs / sum(tau_post_probs)
+
+# most likely changepoint
+day_num <- which.max(tau_post_probs)
+date <- songs_by_day$date[day_num]
+
+posterior <- data.frame(tau = tau_choices, p = tau_post_probs)
+
+ggplot(posterior, aes(x = tau, y = p)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Likelihood of change point by day",
+    subtitle = "This actually is a barplot, this day is just that dominant"
+  )
+```
+
+It turns out only a handful values of tau have non-zero likelihood if rounded to 15 decimals.
+
+```{r tau_probs}
+options(scipen = 999)
+
+posterior |>
+  mutate(p = round(p, 15)) |>
+  filter(p > 0) |>
+  print(row.names = FALSE)
+
+options(scipen = 0)
+```
+
+Comparing distributions before and after most likely changepoint
+
+```{r change_point_dists, message=FALSE}
+songs_by_day <- songs_by_day |>
+  mutate(group = ifelse(row_number() <= day_num, "aPre", "bPost")) |>
+  group_by(group) |>
+  mutate(lambda = sum(n_songs_played) / length(n_songs_played)) |>
+  ungroup() |>
+  mutate(group = sprintf("%s: lambda = %.1f", group, lambda))
+
+ggplot(songs_by_day, aes(x = n_songs_played, fill = group)) +
+  facet_wrap(~group, scales = "free_y") +
+  geom_histogram()
+```
+
+In context of original data with rate param plotted before and after change.
+
+```{r plot_songs_by_day3}
+ggplot(songs_by_day, aes(x = date, y = n_songs_played)) +
+  geom_bar(stat = "identity") +
+  geom_vline(xintercept = date, color = "#FF0000") +
+  geom_line(aes(y = lambda), linetype = "dotted", linewidth = 1) +
+  labs(
+    x = "Date", y = "Count of songs played",
+    title = "Change point in songs played",
+    subtitle = "Average rate plotted as black dotted line"
+  )
+```
+
+## Is a change point view better than 1 $\lambda$?
+
+### Bayes Factor
+
+Kinda just likelihood ratio since I didn't have any prior beliefs baked into the gamma.
+
+$$
+\text{Bayes Factor} = \frac{P(\text{data} \mid M_1)}{P(\text{data} \mid M_2)}
+$$
+
+In this case:
+
+$$
+\text{Bayes Factor} = \frac{P(x_1 | \lambda_1) \times P(x_2 | \lambda_2)}{P(x | \lambda)}
+$$
+
+For computation easier to use log likelihoods
+
+$$
+\text{Bayes Factor} = e^{\ln P(x_1 | \lambda_1)) + \ln P(x_2 | \lambda_2) - \ln P(x | \lambda)}
+$$
+
+The ratio $>>>1$ says that the change point model is better.
+
+```{r bayes_factor}
+x <- songs_by_day$n_songs_played
+n <- length(x)
+x1 <- x[1:day_num]
+x2 <- x[(day_num + 1):n]
+
+exp(pois_log_likelihood(x1) + pois_log_likelihood(x2) - pois_log_likelihood(x))
+```
+
+Alternatively, we can exponentiate and then take the ratio.
+
+If you go that route it's nice to know about [log-sum-exp trick](https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/) to avoid underflow issues when calculating things like $e^{-3755}$ and $e^{-3357}$ (as we'd like to do here).
+
+```{r log_sum_exp_trick}
+log_l_x <- pois_log_likelihood(x)
+
+log_l_x1 <- pois_log_likelihood(x1)
+log_l_x2 <- pois_log_likelihood(x2)
+log_l_x12 <- log_l_x1 + log_l_x2
+
+# adjust to avoid underflow R isses exp(-3754.894) is too small to compute
+adj <- max(c(log_l_x, log_l_x12))
+
+l_x <- exp(log_l_x - adj)
+l_x12 <- exp(log_l_x12 - adj)
+
+round(l_x12 / l_x)
+```
+
+### AIC
+
+I mean why not at this point.
+AIC agrees with BF that change point appears to fit better.
+
+$$
+AIC = -2 \ln (L) + 2k
+$$
+
+```{r aic}
+k <- 1
+-2 * log_l_x + 2 * k
+
+k <- 3
+-2 * log_l_x12 + 2 * k
+```
+
+### ICOMP
+
+Keep it going.
+
+$$
+ICOMP = -2 \ln (L) + 2C_1(\hat{F}^{-1})
+$$
+
+For single lambda parameter poisson process the fisher information is $1 \times 1$.
+
+$$
+F = \left[ \frac{n}{\lambda} \right]
+$$
+
+```{r fisher_info2}
+n / mle_lambda
+```
+
+This means:
+
+$$
+F^{-1} = \left[ \frac{\lambda}{n} \right]
+$$
+
+```{r inverse_fisher_info}
+mle_lambda / n
+```
+
+Calculate C1 measure; $p$ is the rank of the matrix.
+
+$$
+C_1(F^{-1}) = \frac{p}{2} \ln\left( \frac{1}{p} \text{tr}(F^{-1}) \right) - \frac{1}{2} \ln\left( \det(F^{-1}) \right)
+$$
+
+Given this is a $1 \times 1$ matrix we can simplify: $p=1$, $\text{tr}(F^{-1}) = F^{-1}$, $\text{det}(F^{-1}) = F^{-1}$
+
+$$
+C_1(F^{-1}) = \frac{1}{2} \ln(F^{-1}) - \frac{1}{2} \ln(F^{-1}) = 0
+$$
+
+Okie doke, pretty easy to calculate from there since $2C_1(\hat{F}^{-1}) = 0$ in this case.
+
+$$
+ICOMP = -2 \ln (L) + 2C_1(\hat{F}^{-1}) = -2 \ln(L)
+$$
+
+```{r icomp_one_lambda}
+-2 * log_l_x
+```
+
+to be continued...
