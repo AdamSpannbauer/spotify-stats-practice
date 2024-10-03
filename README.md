@@ -1,2 +1,1 @@
-# spotify-stats-practice
-Some notes on random techniques with my spotify songs played in 2022
+See notes at https://adamspannbauer.github.io/spotify-stats-practice/
