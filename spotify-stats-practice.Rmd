@@ -379,7 +379,7 @@ Intuitive explanation of the fisher information.
 Fisher information for our data with estimated $\lambda \approx 53.52$ and $n = 366$
 
 ```{r lamda_fisher_info}
-53.52 / 366
+366 / 53.52
 ```
 
 # Detecting a change point
