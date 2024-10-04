@@ -63,7 +63,8 @@ dim(raw_data)
 print(head(raw_data, 4), row.names = FALSE)
 ```
 
-I want to investigate fitting a Poisson distribution to the count of songs played per day.  Some data transformations to support this are:
+I want to investigate fitting a Poisson distribution to the count of songs played per day.
+Some data transformations to support this are:
 
 -   Calculate seconds played
 -   Create date and hour from date time
@@ -110,7 +111,8 @@ songs_by_day <- listening_22 |>
   replace_na(list(n_songs_played = 0))
 ```
 
-The main focus so far is looking at songs played per day.  Here's a couple different views of that data.
+The main focus so far is looking at songs played per day.
+Here's a couple different views of that data.
 
 ```{r plot_songs_by_day}
 ggplot(songs_by_day, aes(x = date, y = n_songs_played)) +
@@ -711,10 +713,10 @@ $$
 
 to be continued...
 
-
 ## MCMC approach with `rstan`
 
-To use rstan you define model in stan language. Rmd can do this via stan chunk with `output.var` parameter.
+To use rstan you define model in stan language.
+Rmd can do this via stan chunk with `output.var` parameter.
 
 ```{stan stan_model, output.var="changepoint_stan_model"}
 data {
@@ -724,12 +726,12 @@ data {
 
 parameters {
   real<lower=1, upper=N-1> tau; // change-point
-  real<lower=0> lambda1;      // Poisson rate before tau
-  real<lower=0> lambda2;      // Poisson rate after tau
+  real<lower=0> lambda1;        // Poisson rate < tau
+  real<lower=0> lambda2;        // Poisson rate > tau
 }
 
 model {
-  // Vague improper priors
+  // Vague priors
   lambda1 ~ gamma(0.001, 0.001);
   lambda2 ~ gamma(0.001, 0.001);
 
@@ -743,7 +745,27 @@ model {
 }
 ```
 
-Once defined we can sample the posterior via MCMC.  I'm sampling twice with varied iterations of $2000$ and $10000$.
+Once defined we can sample the posterior via MCMC.
+I'm sampling twice with varied iterations of $2000$ and $10000$.
+
+I'm showing sampling results print out for an MCMC with 4 chains and 10000 iterations.
+These results have low `n_eff` (effective sample size) and high `Rhat`.
+
+-   Effective sample size $n_{\text{eff}} = \frac{N}{1 + 2 \sum_{t=1}^{T-1} \rho(t)}$; where $\rho(t)$ is ACF at lag $t$, and $T$ is number of iterations in chain
+    -   Number of independent samples that the chains are effectively providing.
+    -   If we have high autocorrelation we'll have low effective sample size
+    -   Low effective sample size means chains aren't exploring posterior efficiently; might run longer chains or tuned step size
+-   $\hat{R}$ - Potential scale reduction factor - $\hat{R} = \frac{\text{between chain variance}}{\text{within chain variance}}$
+    -   Compares betwee-chain variance to within-chain variance (similar line of thinking to ANOVA) large $\hat{R}$ indicate larger between chain variance and this indicates we haven't converged
+    -   Rules of thumb
+        -   $\hat{R} \approx 1$ - converged
+        -   $\hat{R} > 1.1$ - lack of convergence - chains aren't mixing or exploring the same posterior space (could be stuck in different parts of space)
+            -   Tuning steps to help: increase iterations, adjust step size, adjust treedepth
+            -   Theory steps to help: reevaluate priors or model structure to ensure posterior is well-formed
+
+A piece of the issue might be a limitation of modeling tau.
+Stan can't model discrete parameters natively...
+:( Unlucky choice for this first experiment.
 
 ```{r mcmc_sampling, message=FALSE, warning=FALSE}
 fit_2000 <- sampling(
@@ -760,6 +782,8 @@ fit_10000 <- sampling(
   chains = 4
 )
 
+print(fit_10000)
+
 samples_mcmc_2000 <- extract(fit_2000) |> 
   as.data.frame() |> 
   select(-lp__)
@@ -769,19 +793,24 @@ samples_mcmc_10000 <- extract(fit_10000) |>
   select(-lp__)
 
 samples_mcmc_long <- samples_mcmc_10000 |>  
-  pivot_longer(everything()) |> 
+  mutate(chain = rep(1:4, each = 5000)) |> 
+  pivot_longer(-chain) |> 
   mutate(mcmc_iter = 10000) |> 
   bind_rows(
     samples_mcmc_2000 |>  
-      pivot_longer(everything()) |> 
+      mutate(chain = rep(1:4, each = 1000)) |> 
+      pivot_longer(-chain) |> 
       mutate(mcmc_iter = 2000)
   ) |> 
-  mutate(mcmc_iter = factor(paste("MCMC iter =", mcmc_iter)))
+  mutate(mcmc_iter = factor(paste("MCMC iter =", mcmc_iter))) |> 
+  mutate(chain = factor(chain))
 ```
 
 And then we can plot the posteriors for the 3 parameters.
 
-The table shows the count of samples rounded to nearest integer day
+The table shows the count of samples rounded to nearest integer day (remember Stan can't model discrete parameter).
+From the more manual approach with fixed MLE lambda's the day nominated as most likely change point was $104$.
+Here we see some agreement with a change at $104$ or $105$, but potential evidence of a change at $163$ or $164$.
 
 ```{r mcmc_posterior_tau, warning=FALSE, message=FALSE}
 samples_mcmc_long |> 
@@ -794,24 +823,126 @@ samples_mcmc_long |>
 
 samples_mcmc_long |> 
   filter(name == "tau") |> 
-  ggplot(aes(x = value)) +
+  ggplot(aes(x = value, fill = chain)) +
   facet_wrap(~ mcmc_iter) +
   geom_histogram(binwidth = 1) +
   xlim(0, 366)
 ```
 
-And a view of the posterior lambda distributions
+Bi-modal distributions that seem to relate to the two different options for change-points; feels like we're modeling 2 separate change points with a pair of lambdas each.
 
 ```{r mcmc_posterior_lambdas, message=FALSE}
 samples_mcmc_long |> 
   filter(name != "tau") |> 
-  ggplot(aes(x = value)) +
+  ggplot(aes(x = value, fill = chain)) +
   facet_grid(mcmc_iter ~ name, scales = "free") +
   geom_histogram()
 ```
 
-The ability to sample the joint posterior distribution shows the limitations of the more manual approach.  The more manual approach is fixing the lambda's at their MLE values, where the MCMC process is modeling the variability of these lambda values.
+One of two things happened
 
-These MCMC results seem to indicate that if we're modeling change points there might 2 change points that need to be fit.
+1.  The lack of convergence (indicated by low effective sample size and high $\hat{R}$) means these results are meh and should be fixed before interpretting
+2.  The ability to sample the joint posterior distribution shows the limitations of the more manual approach where we didn't see this bi-modal possibility. The more manual approach is fixing the lambdas at their MLE values, but the MCMC process is modeling the variability of these lambda values.
 
-I haven't set a seed yet so my commentary might not match....oh bother
+### What about... two change points with MCMC?
+
+What's this look like chucking in two different possible change points?
+Just an excuse to modify model.
+
+```{stan stan_model2, output.var="changepoint_stan_model2"}
+data {
+  int<lower=1> N;            // number of observations (days)
+  int x[N];                  // observed data (counts per day)
+}
+
+parameters {
+  real<lower=1, upper=N-1> tau1; // change-point 1
+  real<lower=1, upper=N-1> tau2; // change-point 2
+  real<lower=0> lambda1;         // Poisson rate < tau1
+  real<lower=0> lambda2;         // Poisson rate > tau1 but < tau 2
+  real<lower=0> lambda3;         // Poisson rate > tau2
+}
+
+model {
+  // Vague priors
+  lambda1 ~ gamma(0.001, 0.001);
+  lambda2 ~ gamma(0.001, 0.001);
+  lambda3 ~ gamma(0.001, 0.001);
+
+  // Likelihood
+  for (i in 1:N) {
+    if (i <= tau1) {
+      x[i] ~ poisson(lambda1);
+    } else if (i <= tau2) {
+      x[i] ~ poisson(lambda2);
+    } else {
+      x[i] ~ poisson(lambda3);
+    }
+  }
+}
+```
+
+```{r mcmc_sampling2, message=FALSE, warning=FALSE}
+fit2_2000 <- sampling(
+  object = changepoint_stan_model2,
+  data = list(N = length(x), x = x),
+  iter = 2000,
+  chains = 4
+)
+
+fit2_10000 <- sampling(
+  object = changepoint_stan_model2,
+  data = list(N = length(x), x = x),
+  iter = 10000,
+  chains = 4
+)
+
+print(fit2_10000)
+
+samples2_mcmc_2000 <- extract(fit2_2000) |> 
+  as.data.frame() |> 
+  select(-lp__)
+
+samples2_mcmc_10000 <- extract(fit2_10000) |> 
+  as.data.frame() |> 
+  select(-lp__)
+
+samples2_mcmc_long <- samples2_mcmc_10000 |>  
+  mutate(chain = rep(1:4, each = 5000)) |>
+  pivot_longer(-chain) |> 
+  mutate(mcmc_iter = 10000) |> 
+  bind_rows(
+    samples2_mcmc_2000 |>  
+      mutate(chain = rep(1:4, each = 1000)) |>
+      pivot_longer(-chain) |> 
+      mutate(mcmc_iter = 2000)
+  ) |> 
+  mutate(mcmc_iter = factor(paste("MCMC iter =", mcmc_iter))) |> 
+  mutate(chain = factor(chain))
+```
+
+```{r mcmc_posterior_tau2, warning=FALSE, message=FALSE}
+samples2_mcmc_long |> 
+  filter(name %in% c("tau1", "tau2")) |> 
+  mutate(value = round(value)) |> 
+  group_by(value, mcmc_iter) |> 
+  summarise(count = n()) |> 
+  arrange(mcmc_iter, value) |> 
+  select(mcmc_iter, value, count)
+
+samples2_mcmc_long |> 
+  filter(name %in% c("tau1", "tau2")) |> 
+  ggplot(aes(x = value, fill = chain)) +
+  facet_grid(name ~ mcmc_iter) +
+  geom_histogram(binwidth = 1) +
+  xlim(0, 366)
+```
+
+```{r mcmc_posterior_lambdas2, message=FALSE}
+samples2_mcmc_long |> 
+  filter(!(name %in% c("tau1", "tau2"))) |> 
+  ggplot(aes(x = value, fill = chain)) +
+  facet_grid(mcmc_iter ~ name, scales = "free") +
+  geom_histogram()
+```
+
