@@ -14,6 +14,10 @@ output:
 ```{r setup, include=FALSE}
 library(jsonlite)
 library(tidyverse)
+library(rstan)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
 
 SPOTIFY_DATA_DIR <- "../../../../spotify2022/spotify_data/"
 ```
@@ -384,6 +388,8 @@ Fisher information for our data with estimated $\lambda \approx 53.52$ and $n = 
 
 # Detecting a change point
 
+## Exhaustive search
+
 Was there a change in this listening rate?
 
 ```{r plot_songs_by_day2}
@@ -704,3 +710,108 @@ $$
 ```
 
 to be continued...
+
+
+## MCMC approach with `rstan`
+
+To use rstan you define model in stan language. Rmd can do this via stan chunk with `output.var` parameter.
+
+```{stan stan_model, output.var="changepoint_stan_model"}
+data {
+  int<lower=1> N;            // number of observations (days)
+  int x[N];                  // observed data (counts per day)
+}
+
+parameters {
+  real<lower=1, upper=N-1> tau; // change-point
+  real<lower=0> lambda1;      // Poisson rate before tau
+  real<lower=0> lambda2;      // Poisson rate after tau
+}
+
+model {
+  // Vague improper priors
+  lambda1 ~ gamma(0.001, 0.001);
+  lambda2 ~ gamma(0.001, 0.001);
+
+  // Likelihood
+  for (i in 1:N) {
+    if (i <= tau)
+      x[i] ~ poisson(lambda1);
+    else
+      x[i] ~ poisson(lambda2);
+  }
+}
+```
+
+Once defined we can sample the posterior via MCMC.  I'm sampling twice with varied iterations of $2000$ and $10000$.
+
+```{r mcmc_sampling, message=FALSE, warning=FALSE}
+fit_2000 <- sampling(
+  object = changepoint_stan_model,
+  data = list(N = length(x), x = x),
+  iter = 2000,
+  chains = 4
+)
+
+fit_10000 <- sampling(
+  object = changepoint_stan_model,
+  data = list(N = length(x), x = x),
+  iter = 10000,
+  chains = 4
+)
+
+samples_mcmc_2000 <- extract(fit_2000) |> 
+  as.data.frame() |> 
+  select(-lp__)
+
+samples_mcmc_10000 <- extract(fit_10000) |> 
+  as.data.frame() |> 
+  select(-lp__)
+
+samples_mcmc_long <- samples_mcmc_10000 |>  
+  pivot_longer(everything()) |> 
+  mutate(mcmc_iter = 10000) |> 
+  bind_rows(
+    samples_mcmc_2000 |>  
+      pivot_longer(everything()) |> 
+      mutate(mcmc_iter = 2000)
+  ) |> 
+  mutate(mcmc_iter = factor(paste("MCMC iter =", mcmc_iter)))
+```
+
+And then we can plot the posteriors for the 3 parameters.
+
+The table shows the count of samples rounded to nearest integer day
+
+```{r mcmc_posterior_tau, warning=FALSE, message=FALSE}
+samples_mcmc_long |> 
+  filter(name == "tau") |> 
+  mutate(value = round(value)) |> 
+  group_by(value, mcmc_iter) |> 
+  summarise(count = n()) |> 
+  arrange(mcmc_iter, value) |> 
+  select(mcmc_iter, value, count)
+
+samples_mcmc_long |> 
+  filter(name == "tau") |> 
+  ggplot(aes(x = value)) +
+  facet_wrap(~ mcmc_iter) +
+  geom_histogram(binwidth = 1) +
+  xlim(0, 366)
+```
+
+And a view of the posterior lambda distributions
+
+```{r mcmc_posterior_lambdas, message=FALSE}
+samples_mcmc_long |> 
+  filter(name != "tau") |> 
+  ggplot(aes(x = value)) +
+  facet_grid(mcmc_iter ~ name, scales = "free") +
+  geom_histogram()
+```
+
+The ability to sample the joint posterior distribution shows the limitations of the more manual approach.  The more manual approach is fixing the lambda's at their MLE values, where the MCMC process is modeling the variability of these lambda values.
+
+These MCMC results seem to indicate that if we're modeling change points there might 2 change points that need to be fit.
+
+I haven't set a seed yet so my commentary might not match....oh bother
